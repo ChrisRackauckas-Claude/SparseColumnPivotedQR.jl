@@ -16,7 +16,7 @@ SparseColumnPivotedQRAMDExt = "AMD"
 
 [compat]
 AMD = "0.5.1"
-ForwardDiff = "0.10, 1"
+ForwardDiff = "1"
 LinearAlgebra = "1"
 PrecompileTools = "1"
 Random = "1"
