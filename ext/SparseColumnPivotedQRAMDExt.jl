@@ -3,6 +3,11 @@ module SparseColumnPivotedQRAMDExt
 using SparseColumnPivotedQR: SparseColumnPivotedQR
 using AMD: AMD
 
+# Integer type of AMD.jl's `_l` (long) colamd wrappers. AMD.jl < 0.5.4 exposed
+# it as `AMD.SS_Int`; 0.5.4 removed that constant and hardcodes `Int64` to match
+# SuiteSparse >= 6, where `SuiteSparse_long` is `int64_t` on every platform.
+const SS = isdefined(AMD, :SS_Int) ? AMD.SS_Int : Int64
+
 # Flag the host module so `:default` ordering resolves to `:amd` and so the
 # `:amd` opt-in doesn't error. Set on extension load, never cleared.
 function __init__()
@@ -28,7 +33,6 @@ function SparseColumnPivotedQR._amd_colperm(
         rowptr::Vector{Int}, colval::Vector{Int},
         m::Int, n::Int
     )
-    SS = AMD.SS_Int
     nnz_total = length(colval)
 
     # 0-based CSC column pointers in `p` (length n+1).
@@ -71,8 +75,8 @@ function SparseColumnPivotedQR._amd_colperm(
         return collect(1:n)
     end
     # colamd writes the column permutation (0-based) into p[1:n]; convert to
-    # a 1-based `Vector{Int}` in place (SS_Int == Int on 64-bit, but keep the
-    # explicit conversion so this stays correct on a hypothetical 32-bit SS).
+    # a 1-based `Vector{Int}` (SS == Int on 64-bit, but keep the explicit
+    # conversion so this stays correct when SS and Int differ).
     perm = Vector{Int}(undef, n)
     @inbounds for k in 1:n
         perm[k] = Int(p[k]) + 1

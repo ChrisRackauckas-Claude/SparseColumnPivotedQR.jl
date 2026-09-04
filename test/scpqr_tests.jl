@@ -366,6 +366,20 @@ end
         @test nnz_amd <= 4 * nnz_nat
     end
 
+    @testset "_amd_colperm matches AMD.colamd" begin
+        # Drives the extension's colamd hook directly on the CSR pattern and
+        # checks it against the public `AMD.colamd` on the equivalent CSC.
+        Random.seed!(14)
+        m, n = 50, 40
+        A = sprand(Float64, m, n, 0.1) + sparse(1:n, 1:n, ones(n), m, n)
+        At = sparse(transpose(A))
+        perm = SparseColumnPivotedQR._amd_colperm(
+            Int.(SparseArrays.getcolptr(At)), Int.(rowvals(At)), m, n
+        )
+        @test isperm(perm)
+        @test perm == AMD.colamd(A)
+    end
+
     @testset "scpqr_refactor!" begin
         Random.seed!(13)
         n = 30
