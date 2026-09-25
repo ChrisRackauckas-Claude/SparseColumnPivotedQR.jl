@@ -13,7 +13,7 @@ A pure-Julia, rank-revealing, column-pivoted Householder QR factorization that
 operates directly on
 [`SparseMatrixCSC`](https://docs.julialang.org/en/v1/stdlib/SparseArrays/)
 sparse matrices
-([`SparseMatrixCSR`](https://github.com/JuliaSmoothOptimizers/SparseMatricesCSR.jl)
+([`SparseMatrixCSR`](https://github.com/gridap/SparseMatricesCSR.jl)
 inputs are also accepted when `SparseMatricesCSR` is loaded, via an extension).
 Targets the same "small-to-medium sparse" niche as KLU does for LU
 — low symbolic-phase overhead, no BLAS-3 / multifrontal machinery — while preserving
