@@ -4,7 +4,7 @@ using SparseColumnPivotedQR: SparseColumnPivotedQR
 using SparseArrays: SparseMatrixCSC
 using SparseMatricesCSR: SparseMatrixCSR, sparsecsr
 using LinearAlgebra: rank
-using PrecompileTools: @setup_workload, @compile_workload
+using PrecompileTools: PrecompileTools, @setup_workload, @compile_workload
 
 import SparseColumnPivotedQR: scpqr, scpqr_analyze, scpqr_factor, scpqr_refactor!,
     SparseColumnPivotedQRSymbolic, SparseColumnPivotedQRFactorization
