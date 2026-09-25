@@ -1,137 +1,87 @@
 module SparseColumnPivotedQR
 
-using LinearAlgebra
-using SparseArrays
-using SparseArrays: getcolptr
-using PrecompileTools
+using LinearAlgebra: LinearAlgebra, pinv
+using SparseArrays: SparseArrays, SparseMatrixCSC, nonzeros, rowvals, sparse
+using PrecompileTools: PrecompileTools, @compile_workload, @setup_workload
 
-import LinearAlgebra: ldiv!, rank
-import Base: \, size, eltype
+import LinearAlgebra: ldiv!, rank, Adjoint, Transpose
+import Base: \, size
 
-export csr_qr, csr_analyze, csr_factor, csr_refactor!,
+export scpqr, scpqr_analyze, scpqr_factor, scpqr_refactor!,
     has_amd_extension,
-    CSRQRSymbolic, CSRQRFactorization
+    SparseColumnPivotedQRSymbolic, SparseColumnPivotedQRFactorization
 
-# The adaptive-dense fallback finishes the trailing dense block with LAPACK
-# `geqp3!` / `ormqr!`, which are only defined for the four BLAS float types
+# The adaptive-dense fallback finishes the trailing dense block with an in-place
+# column-pivoted Householder QR, which is only defined for the four BLAS float types
 # (Float32/Float64/ComplexF32/ComplexF64). For any other element type (e.g.
 # `BigFloat` or `ForwardDiff.Dual`) the dense path is unavailable, so we
 # transparently ignore `adaptive_dense` and run the pure-Julia sparse kernel.
-@inline _is_blas_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat
+const _DenseQREltype = Union{Float32, Float64, ComplexF32, ComplexF64}
+
+@inline _is_blas_eltype(::Type{T}) where {T} = T <: _DenseQREltype
 
 # ---------------------------------------------------------------------------
-# Allocation-free LAPACK geqp3 (column-pivoted QR of the dense tail).
+# Allocation-free dense column-pivoted QR.
 # ---------------------------------------------------------------------------
 #
-# `LinearAlgebra.LAPACK.geqp3!` allocates a fresh `work` buffer (and, for
-# complex types, an `rwork` buffer) plus an `info` cell on every call, and it
-# performs a workspace-size query (`lwork = -1`) call followed by the real
-# call each time. For the real-time `csr_refactor!(adaptive_dense=true)` loop
-# we instead pass in a `work`/`rwork`/`info` triple that lives on the pooled
-# workspace and was sized once via `_geqp3_lwork`. This makes the dense tail's
-# geqp3 call do zero heap work in steady state. The bindings mirror the
-# stdlib `ccall`s exactly (LAPACK BLAS-float types only).
-
-for (geqp3, elty, relty) in (
-        (:dgeqp3_, :Float64, :Float64),
-        (:sgeqp3_, :Float32, :Float32),
-        (:zgeqp3_, :ComplexF64, :Float64),
-        (:cgeqp3_, :ComplexF32, :Float32),
-    )
-    iscmplx = elty in (:ComplexF64, :ComplexF32)
-    @eval begin
-        # Query the optimal `lwork` for an `m x n` geqp3 (one workspace call).
-        function _geqp3_lwork(
-                A::Matrix{$elty}, jpvt::Vector{LinearAlgebra.BlasInt},
-                tau::Vector{$elty}
-            )
-            m, n = size(A)
-            lda = max(1, stride(A, 2))
-            work = Vector{$elty}(undef, 1)
-            lwork = LinearAlgebra.BlasInt(-1)
-            info = Ref{LinearAlgebra.BlasInt}()
-            $(
-                if iscmplx
-                    quote
-                        rwork = Vector{$relty}(undef, max(1, 2n))
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$relty}, Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, rwork, info
-                        )
-                    end
-                else
-                    quote
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, info
-                        )
-                    end
-                end
-            )
-            LinearAlgebra.LAPACK.chklapackerror(info[])
-            return LinearAlgebra.BlasInt(real(work[1]))
+# The public `LinearAlgebra.LAPACK.geqp3!` API allocates a work buffer on every
+# call. The adaptive refactor contract is allocation-free, so the dense-tail
+# kernel is implemented locally instead of reaching into LinearAlgebra's
+# nonpublic `@blasfunc`/`libblastrampoline` bindings. It stores the compact
+# Householder representation consumed by `_apply_QH!` and `_apply_Q!` below.
+function _dense_cpqr!(A::Matrix{T}, jpvt::Vector{Int}, tau::Vector{T}) where {T <: _DenseQREltype}
+    m, n = size(A)
+    @inbounds for j in 1:n
+        jpvt[j] = j
+    end
+    @inbounds for k in 1:min(m, n)
+        pivot = k
+        best_norm2 = zero(real(T))
+        for j in k:n
+            norm2 = zero(real(T))
+            for i in k:m
+                norm2 += abs2(A[i, j])
+            end
+            if norm2 > best_norm2
+                best_norm2 = norm2
+                pivot = j
+            end
+        end
+        if pivot != k
+            for i in 1:m
+                A[i, k], A[i, pivot] = A[i, pivot], A[i, k]
+            end
+            jpvt[k], jpvt[pivot] = jpvt[pivot], jpvt[k]
         end
 
-        # geqp3! reusing caller-owned `work`/`rwork`/`info` (no allocation).
-        # `jpvt` must be pre-zeroed (0 = column free to be pivoted). `work`
-        # must be at least the `_geqp3_lwork` size for this `A`.
-        function _geqp3_prealloc!(
-                A::Matrix{$elty}, jpvt::Vector{LinearAlgebra.BlasInt},
-                tau::Vector{$elty}, work::Vector{$elty},
-                rwork::Vector{$relty}, info::Base.RefValue{LinearAlgebra.BlasInt}
-            )
-            m, n = size(A)
-            lda = max(1, stride(A, 2))
-            lwork = LinearAlgebra.BlasInt(length(work))
-            $(
-                if iscmplx
-                    quote
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$relty}, Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, rwork, info
-                        )
-                    end
-                else
-                    quote
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, info
-                        )
-                    end
-                end
-            )
-            LinearAlgebra.LAPACK.chklapackerror(info[])
-            return A, tau, jpvt
+        alpha = A[k, k]
+        normx = sqrt(best_norm2)
+        if normx == zero(normx)
+            tau[k] = zero(T)
+            continue
+        end
+        phase = alpha == zero(T) ? one(T) : alpha / abs(alpha)
+        beta = -phase * T(normx)
+        tau_k = (beta - alpha) / beta
+        tau[k] = tau_k
+        A[k, k] = beta
+        scale = inv(alpha - beta)
+        for i in (k + 1):m
+            A[i, k] *= scale
+        end
+        for j in (k + 1):n
+            dot = A[k, j]
+            for i in (k + 1):m
+                dot += conj(A[i, k]) * A[i, j]
+            end
+            coeff = conj(tau_k) * dot
+            A[k, j] -= coeff
+            for i in (k + 1):m
+                A[i, j] -= coeff * A[i, k]
+            end
         end
     end
+    return A, tau, jpvt
 end
 
 # Grow a (rowval, nzval) pair so that both have at least `needed` capacity.
@@ -164,31 +114,29 @@ end
 # come from validated CSC structure and `x` is always sized `m2`, so eliding
 # bounds checks here is safe.
 #
-# The optimal annotation differs by element type, measured on the bundled
-# 199×199 test matrices (microbenchmark, ns per full V sweep):
+# The optimal annotation differs by element type. For the hardware floats
+# (Float32/Float64) the gather's contiguous `Vx[vp]` load and the `Vx`
+# multiply DO vectorize under `@simd`: the compiler emits a 4-wide packed
+# reduction (`vfmadd231pd ymm`), assembling the gathered `x[Vi[vp]]` lanes
+# via insert/extract. Measured end-to-end on the bundled 199×199 matrices,
+# `@simd` (reduction-split) beats the manual 2× scalar unroll by ~6.5% on
+# the full factor (2034µs → 1903µs total over the 7 test matrices); it also
+# wins a hair in an isolated full-V-sweep microbench (0.98×). The 4-way
+# reduction's instruction-level parallelism overlaps better with the
+# surrounding kernel work than the tight 2× scalar loop does. The scatter
+# uses `@simd ivdep` (rows within a V column are strictly ascending and
+# distinct, so the scattered writes never alias).
 #
-#                Float64   Float32   ComplexF64  ComplexF32
-#   plain         11.6      11.3       14.8        14.2
-#   @simd         11.0      10.3       14.8        14.1
-#   @simd ivdep   11.0      10.7       19.4 (!)    17.4 (!)
-#   2× unroll      9.8       9.9       17.2        17.1
-#   4× unroll     10.0      10.1       16.5        16.8
+# For complex types `@simd` regresses (the compiler's own complex-mul
+# vectorization is disrupted) and `@simd ivdep` is worse still, so they
+# (and the non-hardware reals) take the generic `@inbounds` path below.
 #
-# For the hardware floats the manual 2× unroll wins (~10-20% over @simd). For
-# complex types it regresses badly (the compiler's own complex-mul
-# vectorization is disrupted), and `@simd ivdep` is the worst of all —
-# confirming the earlier WY-experiment observation.
-#
-# The unroll is gated to `Union{Float32, Float64}` rather than all `T <: Real`:
-# `@simd` can't vectorize non-hardware reals (heap-allocated `BigFloat`,
-# composite `ForwardDiff.Dual`) anyway, and there the `a*b + c*d` paired form
-# only materializes extra temporaries — measured a mild regression (~+4% on
-# BigFloat, ~+10% on `Dual{,2}` at the kernel level). So those (and complex)
-# take the generic `@inbounds` + `conj` path. That path also omits `@simd`:
-# the apply is an indexed gather/scatter (`x[Vi[vp]]`) that doesn't vectorize
-# for these eltypes, so `@simd` only adds the reduction-split overhead —
-# measured slower (`Dual` +18–26%, `ComplexF64` +5%; no-op on `BigFloat`).
-# `ivdep` is never used.
+# The `@simd` path is gated to `Union{Float32, Float64}` rather than all
+# `T <: Real`: `@simd` can't vectorize non-hardware reals (heap-allocated
+# `BigFloat`, composite `ForwardDiff.Dual`) anyway, so for those the
+# reduction-split is pure overhead — measured slower (`Dual` +18–26%,
+# `ComplexF64` +5%; no-op on `BigFloat`). Those (and complex) take the
+# generic `@inbounds` + `conj` path below, which omits `@simd`.
 
 # Gather: tau = Σ conj(Vx[vp]) * x[Vi[vp]] over vp in vc1:vc2.
 @inline function _hh_gather(
@@ -196,14 +144,8 @@ end
         vc1::Int, vc2::Int
     ) where {T <: Union{Float32, Float64}}
     tau = zero(T)
-    vp = vc1
-    @inbounds while vp + 1 <= vc2
-        tau += Vx[vp] * x[Vi[vp]] + Vx[vp + 1] * x[Vi[vp + 1]]
-        vp += 2
-    end
-    @inbounds while vp <= vc2
+    @inbounds @simd for vp in vc1:vc2
         tau += Vx[vp] * x[Vi[vp]]
-        vp += 1
     end
     return tau
 end
@@ -229,15 +171,8 @@ end
         Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
         vc1::Int, vc2::Int, scale::T
     ) where {T <: Union{Float32, Float64}}
-    vp = vc1
-    @inbounds while vp + 1 <= vc2
+    @inbounds @simd ivdep for vp in vc1:vc2
         x[Vi[vp]] -= scale * Vx[vp]
-        x[Vi[vp + 1]] -= scale * Vx[vp + 1]
-        vp += 2
-    end
-    @inbounds while vp <= vc2
-        x[Vi[vp]] -= scale * Vx[vp]
-        vp += 1
     end
     return nothing
 end
@@ -271,8 +206,8 @@ end
 #                   matching). Stored 1-based, internal layout.
 
 # ---------------------------------------------------------------------------
-# Workspace pool: large per-call buffers shared across `csr_factor` /
-# `csr_refactor!` calls.
+# Workspace pool: large per-call buffers shared across `scpqr_factor` /
+# `scpqr_refactor!` calls.
 # ---------------------------------------------------------------------------
 #
 # A `_CSRQRWorkspace{T, RT}` holds the value-typed scratch buffers used by
@@ -281,7 +216,7 @@ end
 # the row-pattern buffer `vrows`. It also owns the column-norm cache used
 # by the value-aware repivot.
 #
-# Lifetime: attached lazily to the `CSRQRSymbolic` (whose type T is only
+# Lifetime: attached lazily to the `SparseColumnPivotedQRSymbolic` (whose type T is only
 # known at the first numeric call). Subsequent calls reuse it.
 
 mutable struct _CSRQRWorkspace{T, RT}
@@ -336,29 +271,23 @@ mutable struct _CSRQRWorkspace{T, RT}
     # `solve_xprime` is sized n.
     solve_work::Vector{T}
     solve_xprime::Vector{T}
-    # Pooled scratch for the adaptive-dense fallback so `csr_refactor!` with
+    # Pooled scratch for the adaptive-dense fallback so `scpqr_refactor!` with
     # `adaptive_dense=true` is allocation-free in steady state. All of these
     # are sized lazily on the first dense transition (the dense-tail dims are
     # fixed once the sparsity pattern is). They stay zero-length for matrices
     # whose factorization never transitions to dense, and for non-BLAS element
     # types (where the dense path is unavailable, so they are never used).
     #
-    #   dense_D     : (m2 - ks) x (n - ks) compact LAPACK geqp3 form.
+    #   dense_D     : (m2 - ks) x (n - ks) compact dense CPQR form.
     #   dense_topR  : ks x (n - ks) staging of the top R rows.
-    #   dense_jpvt  : geqp3 column-pivot output, length (n - ks).
-    #   dense_tau   : geqp3 Householder coeffs, length min(m_active, n_active).
+    #   dense_jpvt  : CPQR column-pivot output, length (n - ks).
+    #   dense_tau   : CPQR Householder coefficients, length min(m_active, n_active).
     #   dense_qeff  : composed column permutation, length n.
-    #   dense_work  : preallocated geqp3 work buffer (lwork queried once).
-    #   dense_rwork : preallocated real work for the complex geqp3 (len 2*n_active).
-    #   dense_info  : geqp3 info return cell (reused, never reallocated).
     dense_D::Matrix{T}
     dense_topR::Matrix{T}
-    dense_jpvt::Vector{LinearAlgebra.BlasInt}
+    dense_jpvt::Vector{Int}
     dense_tau::Vector{T}
     dense_qeff::Vector{Int}
-    dense_work::Vector{T}
-    dense_rwork::Vector{RT}
-    dense_info::Base.RefValue{LinearAlgebra.BlasInt}
 end
 
 function _alloc_workspace(
@@ -389,16 +318,35 @@ function _alloc_workspace(
         Vector{T}(undef, n),
         Matrix{T}(undef, 0, 0),
         Matrix{T}(undef, 0, 0),
-        LinearAlgebra.BlasInt[],
-        T[],
         Int[],
         T[],
-        RT[],
-        Ref{LinearAlgebra.BlasInt}(0),
+        Int[],
     )
 end
 
-mutable struct CSRQRSymbolic
+"""
+    SparseColumnPivotedQRSymbolic
+
+Symbolic analysis object returned by [`scpqr_analyze`](@ref). It stores the
+matrix dimensions, ordering choice, symbolic permutations, elimination tree,
+nonzero bounds for the numeric factors, a snapshot of the input sparsity
+pattern, and the reusable numeric workspace used by [`scpqr_factor`](@ref) and
+[`scpqr_refactor!`](@ref).
+
+Construct this object with `scpqr_analyze(A; ordering)` rather than calling the
+field constructor directly.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0])
+sym = scpqr_analyze(A; ordering = :natural)
+size(sym) == (2, 2)
+```
+"""
+mutable struct SparseColumnPivotedQRSymbolic
     m::Int
     n::Int
     m2::Int
@@ -423,7 +371,7 @@ mutable struct CSRQRSymbolic
     workspace::Union{Nothing, _CSRQRWorkspace}
 end
 
-Base.size(S::CSRQRSymbolic) = (S.m, S.n)
+Base.size(S::SparseColumnPivotedQRSymbolic) = (S.m, S.n)
 
 # ---------------------------------------------------------------------------
 # Factorization
@@ -432,7 +380,32 @@ Base.size(S::CSRQRSymbolic) = (S.m, S.n)
 # CSC storage of V (Householders) and R, plus beta (Householder coefficients),
 # plus the symbolic. Permutations come from `sym`.
 
-mutable struct CSRQRFactorization{T, RT}
+"""
+    SparseColumnPivotedQRFactorization
+
+Sparse column-pivoted QR factorization returned by [`scpqr`](@ref),
+[`scpqr_factor`](@ref), and [`scpqr_refactor!`](@ref). It stores the sparse
+Householder vectors, the upper-triangular `R` factor, Householder coefficients,
+rank estimate, tolerance, symbolic analysis object, and any dense-tail
+factorization data produced by `adaptive_dense=true`.
+
+Use `size(F)`, `rank(F)`, `F \\ b`, `ldiv!(x, F, b)`, and adjoint or transpose
+solves (`F' \\ b`, `transpose(F) \\ b`) for the supported factorization
+operations.
+
+# Example
+
+```julia
+using LinearAlgebra, SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+b = [1.0, 2.0, 3.0]
+F = scpqr(A; ordering = :natural)
+x = F \\ b
+rank(F) == 2
+```
+"""
+mutable struct SparseColumnPivotedQRFactorization{T, RT}
     m::Int
     n::Int
     V_colptr::Vector{Int}
@@ -444,16 +417,16 @@ mutable struct CSRQRFactorization{T, RT}
     beta::Vector{RT}
     rnk::Int
     tol::RT
-    sym::CSRQRSymbolic
+    sym::SparseColumnPivotedQRSymbolic
     # Adaptive dense fallback. When the active submatrix becomes dense enough
-    # mid-factorization we switch to LAPACK geqp3 on the trailing block. The
+    # mid-factorization we switch to local column-pivoted QR on the trailing block. The
     # fields below describe that block; they are zero-length / `k_dense == 0`
     # when no transition occurred.
     #
     # `k_dense`     : sparse Householders are V[:, 1..k_dense]; dense tail
     #                 covers columns k_dense+1..n.
-    # `D`           : (m2 - k_dense) x (n - k_dense) compact LAPACK form from
-    #                 geqp3 — strict lower triangle = Householder vectors v,
+    # `D`           : (m2 - k_dense) x (n - k_dense) compact CPQR form —
+    #                 strict lower triangle = Householder vectors v,
     #                 upper triangle = R (also redundantly emitted into CSC R).
     # `dtau`        : Householder coefficients τ for the dense tail.
     # `q_eff`       : composed column permutation (length n). Equals sym.q
@@ -465,10 +438,10 @@ mutable struct CSRQRFactorization{T, RT}
     q_eff::Vector{Int}
 end
 
-LinearAlgebra.rank(F::CSRQRFactorization) = F.rnk
-Base.size(F::CSRQRFactorization) = (F.m, F.n)
-Base.size(F::CSRQRFactorization, d::Integer) = d == 1 ? F.m : (d == 2 ? F.n : 1)
-Base.eltype(::CSRQRFactorization{T}) where {T} = T
+LinearAlgebra.rank(F::SparseColumnPivotedQRFactorization) = F.rnk
+Base.size(F::SparseColumnPivotedQRFactorization) = (F.m, F.n)
+Base.size(F::SparseColumnPivotedQRFactorization, d::Integer) = d == 1 ? F.m : (d == 2 ? F.n : 1)
+Base.eltype(::SparseColumnPivotedQRFactorization{T}) where {T} = T
 
 # ---------------------------------------------------------------------------
 # CSR <-> CSC conversion (pattern + values)
@@ -514,7 +487,7 @@ function _capture_pattern(A::SparseMatrixCSC)
     # Normalize to `Vector{Int}`: the symbolic machinery is `Int`-indexed, and
     # a CSC built from `Int32` arrays would otherwise carry a narrower index
     # type through the captured pattern.
-    colptr = convert(Vector{Int}, getcolptr(A))
+    colptr = convert(Vector{Int}, A.colptr)
     rowval = convert(Vector{Int}, rowvals(A))
     rowptr, colval = _csc_pattern_to_csr(colptr, rowval, m, n)
     return rowptr, colval, colptr, rowval
@@ -522,11 +495,11 @@ end
 
 # Fast structural-pattern comparison against the CSC snapshot held on the
 # symbolic. Compares `colptr`/`rowval` directly so the common fixed-pattern
-# `csr_refactor!` is a cheap O(nnz) integer scan with no allocation.
-function _pattern_matches(S::CSRQRSymbolic, A::SparseMatrixCSC)
+# `scpqr_refactor!` is a cheap O(nnz) integer scan with no allocation.
+function _pattern_matches(S::SparseColumnPivotedQRSymbolic, A::SparseMatrixCSC)
     m, n = size(A)
     (m == S.m && n == S.n) || return false
-    colptr = getcolptr(A)
+    colptr = A.colptr
     rowval = rowvals(A)
     length(colptr) == length(S.pattern_colptr) || return false
     length(rowval) == length(S.pattern_rowval) || return false
@@ -638,8 +611,8 @@ end
 # Default no-op AMD hook; overridden by the AMD.jl extension.
 _amd_colperm(rowptr, colval, m, n) = collect(1:n)
 
-# Set to `true` by the AMD.jl extension on `__init__`. Lets `csr_analyze` /
-# `csr_qr` resolve the default ordering (`:default`) to `:amd` only when the
+# Set to `true` by the AMD.jl extension on `__init__`. Lets `scpqr_analyze` /
+# `scpqr` resolve the default ordering (`:default`) to `:amd` only when the
 # extension is actually loaded, falling back to `:natural` otherwise. Using a
 # Ref so it can be flipped from the extension at load time.
 const _AMD_EXT_LOADED = Ref(false)
@@ -651,6 +624,14 @@ Returns `true` iff the `AMD.jl` extension has been loaded into the current
 session (i.e. `using AMD` has been executed). The default ordering
 `:default` resolves to `:amd` only when this is `true`, falling back to
 `:natural` otherwise.
+
+# Example
+
+```julia
+using SparseColumnPivotedQR
+
+has_amd_extension() isa Bool
+```
 """
 has_amd_extension() = _AMD_EXT_LOADED[]
 
@@ -888,11 +869,11 @@ function _vnz_estimate(leftmost_orig::Vector{Int}, m::Int, n::Int)
 end
 
 # ---------------------------------------------------------------------------
-# Public API: csr_analyze / csr_factor / csr_refactor! / csr_qr
+# Public API: scpqr_analyze / scpqr_factor / scpqr_refactor! / scpqr
 # ---------------------------------------------------------------------------
 
 """
-    csr_analyze(A::SparseMatrixCSC; ordering=:default) -> CSRQRSymbolic
+    scpqr_analyze(A::SparseMatrixCSC; ordering=:default) -> SparseColumnPivotedQRSymbolic
 
 Symbolic analysis phase for the sparse column-pivoted Householder QR
 factorization. Computes the column permutation `q`, row permutation `pinv`,
@@ -918,10 +899,20 @@ when that package is loaded, via an extension that converts to CSC.
                   bounds total apply work). Requires AMD; ~140 µs extra
                   symbolic overhead vs `:amd` alone.
 
-Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
-`csr_refactor!` for matrices with identical sparsity patterns.
+Returns a `SparseColumnPivotedQRSymbolic` that can be passed to `scpqr_factor` and reused via
+`scpqr_refactor!` for matrices with identical sparsity patterns.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0])
+sym = scpqr_analyze(A; ordering = :natural)
+size(sym) == (2, 2)
+```
 """
-function csr_analyze(A::SparseMatrixCSC; ordering::Symbol = :default)
+function scpqr_analyze(A::SparseMatrixCSC; ordering::Symbol = :default)
     m, n = size(A)
     rowptr, colval, colptr_snap, rowval_snap = _capture_pattern(A)
     ordering_use = _resolve_ordering(ordering)
@@ -950,13 +941,13 @@ function csr_analyze(A::SparseMatrixCSC; ordering::Symbol = :default)
         # Tiebreaker prefers :natural: cheaper symbolic, and on shallow
         # etrees the apply-step difference is in the noise.
         if d_a < d_n
-            return CSRQRSymbolic(
+            return SparseColumnPivotedQRSymbolic(
                 m, n, m2_a, q_a, pinv_a, parent_a,
                 leftmost_a, vnz_a, rnz_a, rcount_a, :amd,
                 rowptr, colval, colptr_snap, rowval_snap, nothing
             )
         else
-            return CSRQRSymbolic(
+            return SparseColumnPivotedQRSymbolic(
                 m, n, m2_n, q_n, pinv_n, parent_n,
                 leftmost_n, vnz_n, rnz_n, rcount_n, :natural,
                 rowptr, colval, colptr_snap, rowval_snap, nothing
@@ -966,7 +957,7 @@ function csr_analyze(A::SparseMatrixCSC; ordering::Symbol = :default)
 
     q, pinv, parent, leftmost_perm, m2, vnz, rnz, rcount =
         _build_symbolic(rowptr, colval, m, n, ordering_use)
-    return CSRQRSymbolic(
+    return SparseColumnPivotedQRSymbolic(
         m, n, m2, q, pinv, parent, leftmost_perm,
         vnz, rnz, rcount, ordering_use, rowptr, colval,
         colptr_snap, rowval_snap, nothing
@@ -974,10 +965,10 @@ function csr_analyze(A::SparseMatrixCSC; ordering::Symbol = :default)
 end
 
 """
-    csr_factor(A::SparseMatrixCSC, sym::CSRQRSymbolic; tol=nothing, drop_tol=0,
-               adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
+    scpqr_factor(A::SparseMatrixCSC, sym::SparseColumnPivotedQRSymbolic; tol=nothing, drop_tol=0,
+               adaptive_dense=false, dense_threshold=0.4) -> SparseColumnPivotedQRFactorization
 
-Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
+Numeric factorization given a `SparseColumnPivotedQRSymbolic`. Implements the Davis
 `cs_qr` algorithm (scatter–apply–emit on a dense workspace) with the V/R
 buffers pre-sized from the symbolic phase.
 
@@ -999,11 +990,22 @@ If `adaptive_dense=true`, the numeric kernel monitors the density of the
 just-emitted Householder columns. Once the active submatrix exceeds
 `dense_threshold * (m2 - k + 1)` density (default 40%) over several
 consecutive columns, it materializes the trailing block as a dense matrix
-and finishes with LAPACK `geqp3!`. The composed column permutation is
+and finishes with a dense column-pivoted QR. The composed column permutation is
 stored in `F.q_eff`.
+
+# Example
+
+```julia
+using LinearAlgebra, SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+sym = scpqr_analyze(A; ordering = :natural)
+F = scpqr_factor(A, sym)
+rank(F) == 2
+```
 """
-function csr_factor(
-        A::SparseMatrixCSC{T}, sym::CSRQRSymbolic;
+function scpqr_factor(
+        A::SparseMatrixCSC{T}, sym::SparseColumnPivotedQRSymbolic;
         tol::Union{Nothing, Real} = nothing,
         drop_tol::Real = 0,
         adaptive_dense::Bool = false,
@@ -1016,18 +1018,29 @@ function csr_factor(
 end
 
 """
-    csr_qr(A::SparseMatrixCSC; tol=nothing, ordering=:default, drop_tol=0,
-           adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
+    scpqr(A::SparseMatrixCSC; tol=nothing, ordering=:default, drop_tol=0,
+           adaptive_dense=false, dense_threshold=0.4) -> SparseColumnPivotedQRFactorization
 
-One-shot convenience: equivalent to `csr_factor(A, csr_analyze(A; ordering); tol)`.
+One-shot convenience: equivalent to `scpqr_factor(A, scpqr_analyze(A; ordering); tol)`.
 
 When `ordering=:default` (the default), the column ordering is `:amd` if the
 AMD.jl extension is loaded (`using AMD`) and `:natural` otherwise. On the
 typical dense-fill matrices that arise from nonlinear solver linsolves,
 `:amd` roughly halves the factor time. Pass `ordering=:natural` to opt out
 for matrices whose columns are already well-ordered.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+b = [1.0, 2.0, 3.0]
+F = scpqr(A; ordering = :natural)
+x = F \\ b
+```
 """
-function csr_qr(
+function scpqr(
         A::SparseMatrixCSC;
         tol::Union{Nothing, Real} = nothing,
         ordering::Symbol = :default,
@@ -1035,16 +1048,16 @@ function csr_qr(
         adaptive_dense::Bool = false,
         dense_threshold::Real = 0.4
     )
-    sym = csr_analyze(A; ordering = ordering)
-    return csr_factor(
+    sym = scpqr_analyze(A; ordering = ordering)
+    return scpqr_factor(
         A, sym; tol = tol, drop_tol = drop_tol,
         adaptive_dense = adaptive_dense, dense_threshold = dense_threshold
     )
 end
 
 """
-    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSC; tol=nothing, drop_tol=0,
-                  adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
+    scpqr_refactor!(F::SparseColumnPivotedQRFactorization, A::SparseMatrixCSC; tol=nothing, drop_tol=0,
+                  adaptive_dense=false, dense_threshold=0.4) -> SparseColumnPivotedQRFactorization
 
 Numeric refactorization, mutating `F` in place. If the sparsity pattern of
 `A` matches the one captured in `F.sym`, the symbolic is reused (skipping
@@ -1055,14 +1068,26 @@ Otherwise a fresh analyze is performed (and a new workspace lazily built)
 before refactoring.
 
 The `drop_tol`, `adaptive_dense`, and `dense_threshold` keywords have the
-same meaning as in [`csr_factor`](@ref).
+same meaning as in [`scpqr_factor`](@ref).
 
 `F`'s `V_*`, `R_*`, `beta` buffers are overwritten with the new values
 (growing only if the previous bounds were undersized). The return value is
 `F` itself.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+F = scpqr(A; ordering = :natural)
+A2 = copy(A)
+A2[1, 1] = 3.0
+scpqr_refactor!(F, A2)
+```
 """
-function csr_refactor!(
-        F::CSRQRFactorization{T},
+function scpqr_refactor!(
+        F::SparseColumnPivotedQRFactorization{T},
         A::SparseMatrixCSC;
         tol::Union{Nothing, Real} = nothing,
         drop_tol::Real = 0,
@@ -1074,7 +1099,7 @@ function csr_refactor!(
     if _pattern_matches(F.sym, A)
         return _factor_kernel(A, F.sym, tol, F, dt, adaptive_dense, dth)
     else
-        sym = csr_analyze(A; ordering = F.sym.ordering)
+        sym = scpqr_analyze(A; ordering = F.sym.ordering)
         return _factor_kernel(A, sym, tol, F, dt, adaptive_dense, dth)
     end
 end
@@ -1087,7 +1112,7 @@ end
 # the symbolic. Reuses on subsequent calls; falls back to a fresh allocation
 # if the cached workspace has a mismatched element type.
 @inline function _get_workspace(
-        ::Type{T}, sym::CSRQRSymbolic,
+        ::Type{T}, sym::SparseColumnPivotedQRSymbolic,
         nnz_A::Int
     ) where {T}
     RT = real(T)
@@ -1108,9 +1133,9 @@ end
 end
 
 function _factor_kernel(
-        A::SparseMatrixCSC{T}, sym::CSRQRSymbolic,
+        A::SparseMatrixCSC{T}, sym::SparseColumnPivotedQRSymbolic,
         tol::Union{Nothing, Real},
-        F::Union{Nothing, CSRQRFactorization},
+        F::Union{Nothing, SparseColumnPivotedQRFactorization},
         drop_tol::Real = zero(real(T)),
         adaptive_dense::Bool = false,
         dense_threshold::Real = real(T)(0.4)
@@ -1225,7 +1250,7 @@ function _factor_kernel(
     # Hard safety bound: `is_indep` grows by >= 1 each non-converged iteration and
     # is bounded by n, so n iterations is a strict upper bound. Exceeding it
     # signals a logic error (non-monotone `is_indep`), not a numerical edge case.
-    local F_out::CSRQRFactorization
+    local F_out::SparseColumnPivotedQRFactorization
     converged = false
     iters = 0
     while iters < n
@@ -1270,7 +1295,7 @@ function _factor_kernel(
             sym_cur.pattern_rowptr, sym_cur.pattern_colval,
             sym_cur.m, sym_cur.n, q_next
         )
-        sym_next = CSRQRSymbolic(
+        sym_next = SparseColumnPivotedQRSymbolic(
             sym_cur.m, sym_cur.n, m2n, qn, pinvn, parentn, leftmostn,
             vnzn, rnzn, rcountn, sym_cur.ordering, sym_cur.pattern_rowptr,
             sym_cur.pattern_colval, sym_cur.pattern_colptr,
@@ -1343,7 +1368,7 @@ function _csc_copy_with_norms!(
         A::SparseMatrixCSC{T}
     ) where {T, RT}
     m, n = size(A)
-    colptr_in = getcolptr(A)
+    colptr_in = A.colptr
     rowval_in = rowvals(A)
     nzval_in = nonzeros(A)
 
@@ -1405,7 +1430,7 @@ end
 # or a freshly-built one.
 function _maybe_repivot_zero_cols_from_norms(
         col_norms::Vector{RT},
-        sym::CSRQRSymbolic,
+        sym::SparseColumnPivotedQRSymbolic,
         fro_A::Real
     ) where {RT}
     n = sym.n
@@ -1424,7 +1449,7 @@ function _maybe_repivot_zero_cols_from_norms(
     # Cheap fast-path: if sym.q's trailing positions are already exactly the
     # zero columns (in some order) and the prefix is the non-zero columns
     # (in some order), no rebuild is needed. This catches the common
-    # `csr_refactor!` case where F.sym was already repivoted on the first
+    # `scpqr_refactor!` case where F.sym was already repivoted on the first
     # call.
     nzero_count = 0
     @inbounds for j in 1:n
@@ -1472,7 +1497,7 @@ function _maybe_repivot_zero_cols_from_norms(
         sym.pattern_rowptr, sym.pattern_colval,
         sym.m, sym.n, q_new
     )
-    return CSRQRSymbolic(
+    return SparseColumnPivotedQRSymbolic(
         sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
         vnz2, rnz2, rcount2, sym.ordering, sym.pattern_rowptr,
         sym.pattern_colval, sym.pattern_colptr, sym.pattern_rowval,
@@ -1578,7 +1603,7 @@ function _rebuild_symbolic_for_q(
 end
 
 # Numeric loop. Mutates the workspace and (if F is non-nothing) the output
-# factorization's V/R/beta arrays in place. Returns a CSRQRFactorization
+# factorization's V/R/beta arrays in place. Returns a SparseColumnPivotedQRFactorization
 # (the mutated F if provided, else a freshly-allocated one).
 #
 # `drop_tol > 0` enables approximate-QR fill control: entries j >= 2 of a
@@ -1586,9 +1611,9 @@ end
 # dropped and `β_k` is recomputed from the surviving `|v|^2`. The diagonal
 # v1 is never dropped.
 function _csc_qr_numeric!(
-        ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
+        ws::_CSRQRWorkspace{T, RT}, sym::SparseColumnPivotedQRSymbolic,
         tol_use::RT, tol2::RT,
-        F::Union{Nothing, CSRQRFactorization},
+        F::Union{Nothing, SparseColumnPivotedQRFactorization},
         drop_tol::RT = zero(RT),
         adaptive_dense::Bool = false,
         dense_threshold::RT = RT(0.4),
@@ -1596,7 +1621,7 @@ function _csc_qr_numeric!(
     ) where {T, RT}
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
-    # The dense fallback relies on LAPACK geqp3!/ormqr!, which exist only for
+    # The dense fallback relies on the local CPQR kernel, which is available only for
     # BLAS float types. For generic T (e.g. BigFloat, ForwardDiff.Dual) just run
     # the pure-Julia sparse kernel to completion.
     if adaptive_dense && !_is_blas_eltype(T)
@@ -1786,7 +1811,7 @@ function _csc_qr_numeric!(
         # --- 3) Build Householder for x[vrows[1..vlen]] -----------------
         # Compute alpha, beta_k. v[1] = x[vrows[1]] - alpha; v[j>=2] unchanged.
         nrm2 = zero(RT)
-        for q in 1:vlen
+        @simd for q in 1:vlen
             nrm2 += abs2(x[vrows[q]])
         end
 
@@ -1933,7 +1958,7 @@ function _csc_qr_numeric!(
         resize!(Vi, vnz_total); resize!(Vx, vnz_total)
         resize!(Ri, rnz_total); resize!(Rx, rnz_total)
         if F === nothing
-            return CSRQRFactorization{T, RT}(
+            return SparseColumnPivotedQRFactorization{T, RT}(
                 sym.m, sym.n,
                 Vp, Vi, Vx,
                 Rp, Ri, Rx,
@@ -1979,7 +2004,7 @@ function _csc_qr_numeric!(
     n_active = n - ks
     m_active = m2 - ks
     # Dense block and top-R staging come from the pooled workspace so a
-    # steady-state `csr_refactor!(adaptive_dense=true)` (fixed pattern => fixed
+    # steady-state `scpqr_refactor!(adaptive_dense=true)` (fixed pattern => fixed
     # ks, hence fixed dense-tail dims) does no heap work. The pooled matrices
     # are reused when their dimensions match and (re)allocated only when the
     # dense-tail dims change (which, for a fixed pattern, happens at most once).
@@ -1989,10 +2014,8 @@ function _csc_qr_numeric!(
     #   `top_R` : top_R[i, j] = R[i, ks + j]. Only ereach-pattern rows are
     #             written; the rest must read back as zero, so the used
     #             [1:ks, 1:n_active] block is zeroed before the column loop.
-    dims_changed = false
     if size(ws.dense_D, 1) != m_active || size(ws.dense_D, 2) != n_active
         ws.dense_D = Matrix{T}(undef, m_active, n_active)
-        dims_changed = true
     end
     if size(ws.dense_topR, 1) != ks || size(ws.dense_topR, 2) != n_active
         ws.dense_topR = Matrix{T}(undef, ks, n_active)
@@ -2059,13 +2082,12 @@ function _csc_qr_numeric!(
         end
     end
 
-    # 4) Run LAPACK column-pivoted QR on D. Result:
+    # 4) Run local column-pivoted QR on D. Result:
     #    - Upper triangle of D[1:n_active, 1:n_active] = R_dense
     #    - Strict lower triangle = Householder v's
     #    - dtau = Householder coefficients
     #    - jpvt = column permutation of the dense block (1-based)
-    # Pooled jpvt / dtau (sized to the fixed dense-tail dims). jpvt must be
-    # zero before geqp3 (0 = column free to be pivoted).
+    # Pooled jpvt / dtau are sized to the fixed dense-tail dimensions.
     ntau = min(m_active, n_active)
     if length(ws.dense_jpvt) != n_active
         resize!(ws.dense_jpvt, n_active)
@@ -2075,21 +2097,7 @@ function _csc_qr_numeric!(
     end
     jpvt = ws.dense_jpvt
     dtau = ws.dense_tau
-    @inbounds for j in 1:n_active
-        jpvt[j] = zero(LinearAlgebra.BlasInt)
-    end
-    # Pooled geqp3 work buffer: query the optimal lwork once (when unsized or
-    # the dense-tail dims changed) and reuse thereafter, so the geqp3 call
-    # itself allocates nothing in steady state. The query (`lwork = -1`) only
-    # writes the optimal size into `work[1]`; it does not touch `D`/`jpvt`.
-    if isempty(ws.dense_work) || dims_changed
-        lw = _geqp3_lwork(D, jpvt, dtau)
-        resize!(ws.dense_work, max(1, Int(lw)))
-    end
-    if T <: Complex && length(ws.dense_rwork) != max(1, 2 * n_active)
-        resize!(ws.dense_rwork, max(1, 2 * n_active))
-    end
-    _geqp3_prealloc!(D, jpvt, dtau, ws.dense_work, ws.dense_rwork, ws.dense_info)
+    _dense_cpqr!(D, jpvt, dtau)
 
     # 5) Compose q_eff = [sym.q[1..ks]; sym.q[ks .+ jpvt]].
     if length(ws.dense_qeff) != n
@@ -2157,18 +2165,18 @@ function _csc_qr_numeric!(
     )
 end
 
-# Construct a fresh `CSRQRFactorization` or refresh the fields of the
+# Construct a fresh `SparseColumnPivotedQRFactorization` or refresh the fields of the
 # provided `F` in place. Shared between the pure-sparse and dense-fallback
 # return paths so the dense-tail fields stay in sync with the buffers.
 function _finish_factorization!(
-        F::Union{Nothing, CSRQRFactorization}, sym::CSRQRSymbolic,
+        F::Union{Nothing, SparseColumnPivotedQRFactorization}, sym::SparseColumnPivotedQRSymbolic,
         Vp, Vi::Vector{Int}, Vx::Vector{T},
         Rp, Ri::Vector{Int}, Rx::Vector{T},
         beta::Vector{RT}, rnk::Int, tol_use::RT,
         k_dense::Int, D::Matrix{T}, dtau::Vector{T}, q_eff::Vector{Int}
     ) where {T, RT}
     if F === nothing
-        return CSRQRFactorization{T, RT}(
+        return SparseColumnPivotedQRFactorization{T, RT}(
             sym.m, sym.n,
             Vp, Vi, Vx,
             Rp, Ri, Rx,
@@ -2203,7 +2211,7 @@ end
 #   3) Solve R x' = work[1:n] in place (upper-triangular, columnwise).
 #   4) x = Q_perm x': x[q[k]] = x'[k].
 
-function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
+function _apply_QH!(F::SparseColumnPivotedQRFactorization{T}, work::Vector{T}) where {T}
     Vp = F.V_colptr; Vi = F.V_rowval; Vx = F.V_nzval; beta = F.beta
     n = F.n
     # When an adaptive-dense fallback transitioned at column k_dense, only the
@@ -2223,11 +2231,10 @@ function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
         _hh_scatter!(Vx, Vi, work, vc1, vc2, tau_b)
     end
     if ks > 0
-        # Apply dense Householders to work[ks+1 .. ks+m_active] via LAPACK.
+        # Apply dense Householders to work[ks+1 .. ks+m_active].
         # The dense block is stored in F.D (m_active x n_active), tau in F.dtau.
         # work has length m2; the dense block was built on rows ks+1..m2 of x.
-        # Apply Qᴴ of the dense tail manually: allocation-free (LAPACK ormqr!
-        # allocates an internal work buffer per call) and generic over eltype.
+        # Apply Qᴴ of the dense tail manually and allocation-free.
         # Q = H₁…H_r, H_j = I − τ_j v_j v_jᴴ, v_j in strict-lower D (v_j[j]=1).
         # Qᴴ applies H_jᴴ for j=1..r: y −= conj(τ_j)(v_jᴴ y) v_j.
         m_active = size(F.D, 1)
@@ -2251,7 +2258,7 @@ function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
     return work
 end
 
-function _apply_Q!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
+function _apply_Q!(F::SparseColumnPivotedQRFactorization{T}, work::Vector{T}) where {T}
     Vp = F.V_colptr; Vi = F.V_rowval; Vx = F.V_nzval; beta = F.beta
     n = F.n
     ks = F.k_dense
@@ -2295,7 +2302,7 @@ end
 # Solve R z = c (R is upper triangular in CSC). Rank-revealing: rows
 # (k+1..n) of z are zeroed if R[k,k] is below threshold.
 function _usolve!(
-        z::AbstractVector{T}, F::CSRQRFactorization{T},
+        z::AbstractVector{T}, F::SparseColumnPivotedQRFactorization{T},
         c::AbstractVector{T}
     ) where {T}
     n = F.n
@@ -2356,7 +2363,7 @@ function _usolve!(
 end
 
 function LinearAlgebra.ldiv!(
-        x::AbstractVector{T}, F::CSRQRFactorization{T},
+        x::AbstractVector{T}, F::SparseColumnPivotedQRFactorization{T},
         b::AbstractVector{T}
     ) where {T}
     length(b) == F.m || throw(DimensionMismatch("b length $(length(b)) != m=$(F.m)"))
@@ -2403,17 +2410,161 @@ function LinearAlgebra.ldiv!(
     return x
 end
 
-function Base.:\(F::CSRQRFactorization{T}, b::AbstractVector{T}) where {T}
+function Base.:\(F::SparseColumnPivotedQRFactorization{T}, b::AbstractVector{T}) where {T}
     x = zeros(T, F.n)
     ldiv!(x, F, b)
     return x
 end
 
-function Base.:\(F::CSRQRFactorization{T}, b::AbstractVector) where {T}
+function Base.:\(F::SparseColumnPivotedQRFactorization{T}, b::AbstractVector) where {T}
     bb = convert(Vector{T}, b)
     x = zeros(T, F.n)
     ldiv!(x, F, bb)
     return x
+end
+
+# ---------------------------------------------------------------------------
+# Adjoint / transpose solve path.
+# ---------------------------------------------------------------------------
+#
+# The factorization is S = P A Qcol = Q R (S is m2 x n; R upper triangular,
+# stored CSC; the row permutation is `pinv`, the effective column permutation
+# `q_eff`). Equivalently A = Pᵀ Q R̃ Qcolᵀ with R̃ = [R; 0] (m2 x n), so
+#
+#     Aᴴ = Qcol R̃ᴴ Qᴴ P,    R̃ᴴ = [Rᴴ | 0]  (n x m2).
+#
+# To solve Aᴴ x = b (x length m, b length n):
+#   1) z₁ = Qcolᵀ b              i.e. z₁[k] = b[q_eff[k]]            (length n)
+#   2) Rᴴ z₂ = z₁                lower-triangular forward solve      (length n)
+#   3) work[1:n] = z₂; work[n+1:m2] = 0; work := Q work             (apply Q)
+#   4) x[i] = work[pinv[i]]      (i.e. Pᵀ; drop fictitious rows > m)
+#
+# Step 3 reuses `_apply_Q!` directly (it already composes the sparse and dense
+# tails in the correct order). Only the Rᴴ (lower-triangular) solve is new.
+#
+# Rank-deficient / rectangular handling mirrors the primal `_usolve!`: rows of
+# the forward solve whose diagonal magnitude is at/below `F.tol` are pinned to
+# zero, giving the consistent minimum-norm / least-squares branch. Because the
+# rank-deficient factor places every zero pivot in the trailing positions
+# (k > rnk) of R, the forward solve over leading positions is exact.
+
+Base.adjoint(F::SparseColumnPivotedQRFactorization) = Adjoint(F)
+Base.transpose(F::SparseColumnPivotedQRFactorization) = Transpose(F)
+
+# Solve Rᴴ z = c, where R is the n x n upper-triangular CSC factor; Rᴴ is
+# lower triangular. Forward substitution: row k of Rᴴ equals conj of column k
+# of R (R[i,k] for i <= k). Rank-revealing: z[k] = 0 when |R[k,k]| <= tol.
+function _usolve_adjoint!(
+        z::AbstractVector{T}, F::SparseColumnPivotedQRFactorization{T},
+        c::AbstractVector{T}
+    ) where {T}
+    n = F.n
+    Rp = F.R_colptr; Ri = F.R_rowval; Rx = F.R_nzval
+    tol_use = F.tol
+    @inbounds for k in 1:n
+        rc1 = Rp[k]; rc2 = Rp[k + 1] - 1
+        # Identify the diagonal slot and accumulate the strictly-lower (in Rᴴ)
+        # contribution sum_{i<k} conj(R[i,k]) z[i]. The emit places the diagonal
+        # at the last slot for sparse columns; the dense tail may be out of
+        # order, so search generally.
+        diag_p = 0
+        acc = c[k]
+        for p in rc1:rc2
+            i = Ri[p]
+            if i == k
+                diag_p = p
+            elseif i < k
+                acc -= conj(Rx[p]) * z[i]
+            end
+        end
+        if diag_p == 0
+            z[k] = zero(T)
+            continue
+        end
+        d = Rx[diag_p]
+        if abs(d) <= tol_use || d == 0
+            z[k] = zero(T)
+            continue
+        end
+        z[k] = acc / conj(d)
+    end
+    return z
+end
+
+function _ldiv_adjoint!(
+        x::AbstractVector{T}, F::SparseColumnPivotedQRFactorization{T},
+        b::AbstractVector{T}
+    ) where {T}
+    length(b) == F.n ||
+        throw(DimensionMismatch("b length $(length(b)) != n=$(F.n) for adjoint solve"))
+    length(x) == F.m ||
+        throw(DimensionMismatch("x length $(length(x)) != m=$(F.m) for adjoint solve"))
+    m, n, m2 = F.m, F.n, F.sym.m2
+    pinv = F.sym.pinv
+    q = F.q_eff
+
+    ws = F.sym.workspace
+    local work::Vector{T}
+    local z::Vector{T}
+    if ws isa _CSRQRWorkspace{T, real(T)} &&
+            length(ws.solve_work) >= m2 && length(ws.solve_xprime) >= n
+        work = ws.solve_work
+        z = ws.solve_xprime
+    else
+        work = Vector{T}(undef, m2)
+        z = Vector{T}(undef, n)
+    end
+
+    # 1) z₁ = Qcolᵀ b.
+    @inbounds for k in 1:n
+        z[k] = b[q[k]]
+    end
+    # 2) Rᴴ z₂ = z₁ (forward solve, in place on z).
+    _usolve_adjoint!(z, F, z)
+    # 3) work = Q [z₂; 0].
+    @inbounds for k in 1:n
+        work[k] = z[k]
+    end
+    @inbounds for i in (n + 1):m2
+        work[i] = zero(T)
+    end
+    _apply_Q!(F, work)
+    # 4) x = Pᵀ work (drop fictitious rows > m).
+    @inbounds for i in 1:m
+        x[i] = work[pinv[i]]
+    end
+    return x
+end
+
+function LinearAlgebra.ldiv!(
+        x::AbstractVector{T}, aF::Adjoint{T, <:SparseColumnPivotedQRFactorization{T}},
+        b::AbstractVector{T}
+    ) where {T}
+    return _ldiv_adjoint!(x, parent(aF), b)
+end
+
+function LinearAlgebra.ldiv!(
+        x::AbstractVector{T}, tF::Transpose{T, <:SparseColumnPivotedQRFactorization{T}},
+        b::AbstractVector{T}
+    ) where {T <: Real}
+    return _ldiv_adjoint!(x, parent(tF), b)
+end
+
+function Base.:\(aF::Adjoint{T, <:SparseColumnPivotedQRFactorization{T}}, b::AbstractVector{T}) where {T}
+    x = zeros(T, parent(aF).m)
+    return _ldiv_adjoint!(x, parent(aF), b)
+end
+
+function Base.:\(aF::Adjoint{T, <:SparseColumnPivotedQRFactorization{T}}, b::AbstractVector) where {T}
+    bb = convert(Vector{T}, b)
+    x = zeros(T, parent(aF).m)
+    return _ldiv_adjoint!(x, parent(aF), bb)
+end
+
+function Base.:\(tF::Transpose{T, <:SparseColumnPivotedQRFactorization{T}}, b::AbstractVector) where {T <: Real}
+    bb = convert(Vector{T}, b)
+    x = zeros(T, parent(tF).m)
+    return _ldiv_adjoint!(x, parent(tF), bb)
 end
 
 # ---------------------------------------------------------------------------
@@ -2439,16 +2590,16 @@ end
                 A = sparse(rows, cols, vals, 6, 6)
                 b = ones(T, 6)
 
-                F = csr_qr(A; ordering = :natural)
+                F = scpqr(A; ordering = :natural)
                 F \ b
                 rank(F)
                 size(F)
                 size(F, 1)
 
                 # analyze / factor / refactor! round-trip with the same pattern.
-                sym = csr_analyze(A; ordering = :natural)
-                G = csr_factor(A, sym)
-                csr_refactor!(G, A)
+                sym = scpqr_analyze(A; ordering = :natural)
+                G = scpqr_factor(A, sym)
+                scpqr_refactor!(G, A)
                 G \ b
 
                 # Rank-deficient 6x6: column 6 is a copy of column 1 (drop the
@@ -2457,7 +2608,7 @@ end
                 dcols = Ti[1, 2, 3, 4, 5, 2, 3, 4, 5, 1]
                 dvals = T[4, 4, 4, 4, 4, 1, 1, 1, 1, 4]
                 Ad = sparse(drows, dcols, dvals, 6, 6)
-                Fd = csr_qr(Ad; ordering = :natural)
+                Fd = scpqr(Ad; ordering = :natural)
                 Fd \ b
                 rank(Fd)
             end

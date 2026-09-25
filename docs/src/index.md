@@ -4,8 +4,11 @@ SparseColumnPivotedQR.jl is a component of the
 [SciML](https://sciml.ai/) ecosystem providing a pure-Julia,
 rank-revealing, column-pivoted Householder QR factorization that operates
 directly on
+[`SparseMatrixCSC`](https://docs.julialang.org/en/v1/stdlib/SparseArrays/)
+sparse matrices. A
 [`SparseMatrixCSR`](https://github.com/gridap/SparseMatricesCSR.jl)
-sparse matrices.
+input is also accepted when `SparseMatricesCSR` is loaded, via an extension
+that converts to CSC.
 
 The package targets the same "small-to-medium sparse" niche as KLU does for
 LU — low symbolic-phase overhead, no BLAS-3 / multifrontal machinery — while
@@ -23,20 +26,23 @@ Pkg.add("SparseColumnPivotedQR")
 ## Quick start
 
 ```julia
-using SparseArrays, SparseMatricesCSR, SparseColumnPivotedQR
+using SparseArrays, SparseColumnPivotedQR
 using AMD  # enables the recommended AMD column ordering
 
 # A 5×5 sparse matrix and a right-hand side.
-A_csc = sparse([1.0  0   2   0   0;
-                0    3   0   0   1;
-                4    0   5   0   0;
-                0    0   0   6   0;
-                0    7   0   0   8])
-A = SparseMatrixCSR(A_csc)
+A = sparse(
+    [
+        1.0  0   2   0   0;
+        0    3   0   0   1;
+        4    0   5   0   0;
+        0    0   0   6   0;
+        0    7   0   0   8
+    ]
+)
 b = [1.0, 2.0, 3.0, 4.0, 5.0]
 
 # One-shot factor + solve.
-F = csr_qr(A)
+F = scpqr(A)
 x = F \ b
 
 # Rank and dimensions.
@@ -45,7 +51,7 @@ rank(F), size(F)
 
 ## Column ordering
 
-`csr_qr` / `csr_analyze` accept an `ordering` keyword. Available choices:
+`scpqr` / `scpqr_analyze` accept an `ordering` keyword. Available choices:
 
 | ordering    | meaning                                                              |
 |-------------|----------------------------------------------------------------------|
@@ -63,15 +69,15 @@ explicitly for matrices that are already well-ordered (block diagonal,
 banded, etc.).
 
 ```julia
-F1 = csr_qr(A)                          # = :default (= :amd if AMD loaded)
-F2 = csr_qr(A; ordering = :natural)     # opt-in to the chain etree
-F3 = csr_qr(A; ordering = :amd)         # explicit :amd; errors if AMD.jl not loaded
-F4 = csr_qr(A; ordering = :adaptive)    # build both, keep the shallower etree
+F1 = scpqr(A)                          # = :default (= :amd if AMD loaded)
+F2 = scpqr(A; ordering = :natural)     # opt-in to the chain etree
+F3 = scpqr(A; ordering = :amd)         # explicit :amd; errors if AMD.jl not loaded
+F4 = scpqr(A; ordering = :adaptive)    # build both, keep the shallower etree
 ```
 
 ## Approximate factorization
 
-`csr_qr` accepts a `drop_tol::Real` keyword (default `0`). When
+`scpqr` accepts a `drop_tol::Real` keyword (default `0`). When
 `drop_tol > 0`, entries of each Householder vector `V[:, k]` with
 `|v_i| <= drop_tol * ‖v‖` are discarded after the reflector is built;
 `β_k` is rescaled for the truncated vector so `H̃ = I - β̃ ṽ ṽᵀ` remains
@@ -81,8 +87,8 @@ entries on every subsequent call. Useful when you can tolerate a larger
 residual to shrink the factorized form.
 
 ```julia
-F_exact = csr_qr(A)                    # drop_tol = 0
-F_approx = csr_qr(A; drop_tol = 1e-8)  # smaller V, larger ‖A x - b‖
+F_exact = scpqr(A)                    # drop_tol = 0
+F_approx = scpqr(A; drop_tol = 1.0e-8)  # smaller V, larger ‖A x - b‖
 ```
 
 ## Rank-deficient inputs
@@ -93,9 +99,9 @@ least-squares solution whose residual matches the SVD pseudoinverse minimum
 to floating-point precision.
 
 ```julia
-A_singular = SparseMatrixCSR(sparse([1.0 2.0; 0.5 1.0; 2.0 4.0]))  # rank 1
+A_singular = sparse([1.0 2.0; 0.5 1.0; 2.0 4.0])  # rank 1
 b = [1.0, 1.0, 1.0]
-F = csr_qr(A_singular)
+F = scpqr(A_singular)
 rank(F)              # → 1
 norm(A_singular * (F \ b) - b)   # matches the SVD minimum residual
 ```

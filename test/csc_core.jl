@@ -1,6 +1,7 @@
-# CSC-native core tests. Run in a SEPARATE process that does NOT load
-# `SparseMatricesCSR`, so this proves the `SparseMatrixCSC` API works as the
-# native path with the CSR extension absent. (Driven from `runtests.jl`.)
+# CSC-native core tests: the `SparseMatrixCSC` API must work as the native
+# path with the CSR extension absent. `csr_extension_tests.jl` also includes
+# this file in a fresh subprocess that never loads `SparseMatricesCSR`; keep
+# this file free of `SparseMatricesCSR` so that check stays valid.
 using Test
 using LinearAlgebra
 using SparseArrays
@@ -13,6 +14,21 @@ using AMD  # AMD extension is independent of the CSR extension
 ) === nothing "SparseMatricesCSR extension must NOT be loaded in the CSC-core test process"
 
 @testset "CSC-native core (no SparseMatricesCSR loaded)" begin
+    @testset "Generic factorization interfaces" begin
+        A = sparse([2.0 0.0; 0.0 3.0; 1.0 1.0])
+        F = scpqr(A; ordering = :natural)
+        b = [2.0, 3.0, 2.0]
+        x = zeros(2)
+
+        @test size(F) == size(A)
+        @test size(F, 1) == size(A, 1)
+        @test size(F, 2) == size(A, 2)
+        @test eltype(F) === Float64
+        @test rank(F) == 2
+        @test ldiv!(x, F, b) === x
+        @test A * x ≈ b
+    end
+
     for T in (Float64, ComplexF64)
         cv(M) = T <: Complex ? (T.(M) .+ T(0.3im) .* (M .!= 0)) : T.(M)
 
@@ -22,7 +38,7 @@ using AMD  # AMD extension is independent of the CSR extension
             base = sprand(Float64, n, n, 0.2) + 5I
             A = convert(SparseMatrixCSC{T, Int}, cv(Matrix(base)))
             b = ones(T, n)
-            F = csr_qr(A)
+            F = scpqr(A)
             x = F \ b
             @test norm(A * x - b) / norm(b) < 1.0e-9
             @test rank(F) == n
@@ -35,7 +51,7 @@ using AMD  # AMD extension is independent of the CSR extension
             base = base + sparse(1:n, 1:n, ones(n), m, n)
             A = convert(SparseMatrixCSC{T, Int}, cv(Matrix(base)))
             b = randn(T, m)
-            F = csr_qr(A)
+            F = scpqr(A)
             x = F \ b
             # Full-column-rank tall LS: the dense `\` is the unique LS solution.
             @test x ≈ Matrix(A) \ b rtol = 1.0e-8
@@ -49,7 +65,7 @@ using AMD  # AMD extension is independent of the CSR extension
             base = base + sparse(1:m, 1:m, ones(m), m, n)
             A = convert(SparseMatrixCSC{T, Int}, cv(Matrix(base)))
             b = randn(T, m)
-            F = csr_qr(A)
+            F = scpqr(A)
             x = F \ b
             @test norm(A * x - b) / norm(b) < 1.0e-8   # consistent system
             @test rank(F) == m
@@ -64,7 +80,7 @@ using AMD  # AMD extension is independent of the CSR extension
             M[:, n] = M[:, 1]          # duplicate column -> rank n-1
             A = convert(SparseMatrixCSC{T, Int}, cv(M))
             b = randn(T, m)
-            F = csr_qr(A)
+            F = scpqr(A)
             @test rank(F) == n - 1
             x = F \ b
             # Minimum-residual solve: the residual must match the true
@@ -75,7 +91,7 @@ using AMD  # AMD extension is independent of the CSR extension
             @test r_csc ≈ r_min rtol = 1.0e-6
         end
 
-        @testset "csr_refactor! reuse path ($T)" begin
+        @testset "scpqr_refactor! reuse path ($T)" begin
             Random.seed!(5)
             n = 30
             sp = sprand(Float64, n, n, 0.2)
@@ -87,16 +103,16 @@ using AMD  # AMD extension is independent of the CSR extension
             A1 = mk(randn(length(rows)))
             A2 = mk(randn(length(rows)))
             b = randn(T, n)
-            F = csr_qr(A1; ordering = :amd)
-            csr_refactor!(F, A2)
+            F = scpqr(A1; ordering = :amd)
+            scpqr_refactor!(F, A2)
             x2 = F \ b
             @test norm(A2 * x2 - b) / norm(b) < 1.0e-9
-            csr_refactor!(F, A1)
+            scpqr_refactor!(F, A1)
             x1 = F \ b
             @test norm(A1 * x1 - b) / norm(b) < 1.0e-9
         end
 
-        @testset "csr_refactor! zero-alloc steady state ($T)" begin
+        @testset "scpqr_refactor! zero-alloc steady state ($T)" begin
             Random.seed!(6)
             n = 30
             sp = sprand(Float64, n, n, 0.2)
@@ -107,11 +123,11 @@ using AMD  # AMD extension is independent of the CSR extension
             )
             A1 = mk(randn(length(rows)))
             A2 = mk(randn(length(rows)))
-            F = csr_qr(A1; ordering = :amd)
-            csr_refactor!(F, A2)   # warm
-            csr_refactor!(F, A1)
-            @test (@allocated csr_refactor!(F, A2)) == 0
-            @test (@allocated csr_refactor!(F, A1)) == 0
+            F = scpqr(A1; ordering = :amd)
+            scpqr_refactor!(F, A2)   # warm
+            scpqr_refactor!(F, A1)
+            @test (@allocated scpqr_refactor!(F, A2)) == 0
+            @test (@allocated scpqr_refactor!(F, A1)) == 0
         end
     end
 end

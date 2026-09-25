@@ -1,34 +1,36 @@
 module SparseColumnPivotedQRSparseMatricesCSRExt
 
-using SparseColumnPivotedQR
-using LinearAlgebra
-using SparseArrays
-using SparseMatricesCSR
-using PrecompileTools
+using SparseColumnPivotedQR: SparseColumnPivotedQR
+using SparseArrays: SparseMatrixCSC
+using SparseMatricesCSR: SparseMatrixCSR, sparsecsr
+using LinearAlgebra: rank
+using PrecompileTools: @setup_workload, @compile_workload
 
-import SparseColumnPivotedQR: csr_qr, csr_analyze, csr_factor, csr_refactor!,
-    CSRQRSymbolic, CSRQRFactorization
+import SparseColumnPivotedQR: scpqr, scpqr_analyze, scpqr_factor, scpqr_refactor!,
+    SparseColumnPivotedQRSymbolic, SparseColumnPivotedQRFactorization
 
-# Convert a `SparseMatrixCSR` to the `SparseMatrixCSC` the core operates on.
-# This is the same CSR -> CSC conversion the kernel performed internally before
-# the CSC-native refactor; it now lives here so the core never depends on
-# `SparseMatricesCSR`.
+# Convert a `SparseMatrixCSR` to the `SparseMatrixCSC` the core operates on, so
+# the core never depends on `SparseMatricesCSR`.
 @inline _to_csc(A::SparseMatrixCSR) = SparseMatrixCSC(A)
 
-function csr_analyze(A::SparseMatrixCSR; ordering::Symbol = :default)
-    return csr_analyze(_to_csc(A); ordering = ordering)
+function scpqr_analyze(A::SparseMatrixCSR; ordering::Symbol = :default)
+    return scpqr_analyze(_to_csc(A); ordering = ordering)
 end
 
-function csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; kwargs...)
-    return csr_factor(_to_csc(A), sym; kwargs...)
+function scpqr_factor(
+        A::SparseMatrixCSR, sym::SparseColumnPivotedQRSymbolic; kwargs...
+    )
+    return scpqr_factor(_to_csc(A), sym; kwargs...)
 end
 
-function csr_qr(A::SparseMatrixCSR; kwargs...)
-    return csr_qr(_to_csc(A); kwargs...)
+function scpqr(A::SparseMatrixCSR; kwargs...)
+    return scpqr(_to_csc(A); kwargs...)
 end
 
-function csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; kwargs...)
-    return csr_refactor!(F, _to_csc(A); kwargs...)
+function scpqr_refactor!(
+        F::SparseColumnPivotedQRFactorization, A::SparseMatrixCSR; kwargs...
+    )
+    return scpqr_refactor!(F, _to_csc(A); kwargs...)
 end
 
 # Keep the CSR entry points specialized in the package image. Mirrors the
@@ -43,20 +45,20 @@ end
                 A = sparsecsr(rows, cols, vals, 6, 6)
                 b = ones(T, 6)
 
-                F = csr_qr(A; ordering = :natural)
+                F = scpqr(A; ordering = :natural)
                 F \ b
                 rank(F)
 
-                sym = csr_analyze(A; ordering = :natural)
-                G = csr_factor(A, sym)
-                csr_refactor!(G, A)
+                sym = scpqr_analyze(A; ordering = :natural)
+                G = scpqr_factor(A, sym)
+                scpqr_refactor!(G, A)
                 G \ b
 
                 drows = Ti[1, 2, 3, 4, 5, 1, 2, 3, 4, 6]
                 dcols = Ti[1, 2, 3, 4, 5, 2, 3, 4, 5, 1]
                 dvals = T[4, 4, 4, 4, 4, 1, 1, 1, 1, 4]
                 Ad = sparsecsr(drows, dcols, dvals, 6, 6)
-                Fd = csr_qr(Ad; ordering = :natural)
+                Fd = scpqr(Ad; ordering = :natural)
                 Fd \ b
                 rank(Fd)
             end
